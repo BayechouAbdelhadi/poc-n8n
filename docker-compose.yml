@@ -1,0 +1,221 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: saas-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: saas_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - saas-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: saas-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - saas-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # n8n Workflow Automation with JWT SSO
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: saas-n8n
+    restart: unless-stopped
+    environment:
+      # Database
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: saas_db
+      DB_POSTGRESDB_USER: postgres
+      DB_POSTGRESDB_PASSWORD: postgres
+      DB_POSTGRESDB_SCHEMA: n8n
+
+      # n8n Configuration
+      N8N_PROTOCOL: http
+      N8N_HOST: n8n.saas.local
+      N8N_PORT: 5678
+      N8N_EDITOR_BASE_URL: http://n8n.saas.local
+      WEBHOOK_URL: http://n8n.saas.local
+
+      # Execution Mode
+      EXECUTIONS_MODE: regular
+      EXECUTIONS_PROCESS: main
+
+      # Security
+      N8N_ENCRYPTION_KEY: your-encryption-key-change-in-production-min-10-chars
+      N8N_SECURE_COOKIE: "false"
+      
+      # JWT-Based Authentication (Embed Pattern)
+      N8N_JWT_AUTH_ACTIVE: "true"
+      N8N_JWT_AUTH_HEADER: "Authorization"
+      N8N_JWT_AUTH_HEADER_VALUE_PREFIX: "Bearer "
+      N8N_JWKS_URI: "http://backend:3001/api/auth/.well-known/jwks.json"
+      
+      # Auto-create users from JWT
+      N8N_AUTO_CREATE_USERS: "true"
+      N8N_USER_MANAGEMENT_JWT_SECRET: "your-jwt-secret-must-match-backend-secret-min-32-chars"
+      
+      # Disable built-in auth (users only come from JWT)
+      N8N_BASIC_AUTH_ACTIVE: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      
+      # Allow iframe embedding
+      N8N_DISABLE_UI: "false"
+
+      # Multi-tenancy
+      N8N_MULTI_MAIN_SETUP_INSTANCE_ID: "main"
+      
+      # Logging
+      N8N_LOG_LEVEL: info
+      N8N_LOG_OUTPUT: console
+
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - saas-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # NestJS Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: saas-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      
+      # Database
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: saas_db
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      
+      # JWT Configuration (used for both your app and n8n)
+      JWT_SECRET: your-jwt-secret-must-match-backend-secret-min-32-chars
+      JWT_EXPIRATION: 1h
+      JWT_REFRESH_EXPIRATION: 7d
+      
+      # n8n JWT Configuration
+      N8N_JWT_SECRET: your-jwt-secret-must-match-backend-secret-min-32-chars
+      N8N_JWT_EXPIRATION: 1h
+      
+      # n8n URLs
+      N8N_URL: http://n8n.saas.local
+      N8N_INTERNAL_URL: http://n8n:5678
+      N8N_API_KEY: your-n8n-api-key
+      
+      # Application URLs
+      APP_URL: http://app.saas.local
+      API_URL: http://api.saas.local
+      
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      n8n:
+        condition: service_healthy
+    networks:
+      - saas-network
+    command: npm run start:dev
+
+  # React Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: saas-frontend
+    restart: unless-stopped
+    environment:
+      REACT_APP_API_URL: http://api.saas.local
+      REACT_APP_N8N_URL: http://n8n.saas.local
+      REACT_APP_APP_URL: http://app.saas.local
+      REACT_APP_ENVIRONMENT: development
+      WATCHPACK_POLLING: "true"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - saas-network
+    stdin_open: true
+    tty: true
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: saas-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infrastructure/nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - frontend
+      - backend
+      - n8n
+    networks:
+      - saas-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  saas-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  n8n_data:
